@@ -109,7 +109,7 @@ impl DynstrPatchCandidate {
         }
 
         Ok(true)
-    
+    }
 }
 
 #[derive(Default)]
