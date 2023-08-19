@@ -32,7 +32,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn has_dt_runpath(elf_object: &elf::ElfBytes<'_, elf::endian::AnyEndian>) -> Result<bool> {
+fn has_dt_runpath(elf_object: &elf::ElfBytes<'_, elf::endian::AnyEndian>) -> Result<bool> {
     let section_dynamic = elf_object
         .dynamic()
         .context(ParseElfSnafu)?

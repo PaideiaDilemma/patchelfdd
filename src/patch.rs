@@ -80,13 +80,36 @@ impl DynstrPatchCandidate {
         }
     }
 
-    fn _check_valid(&self, _elf_object: &ElfBytes<'_, AnyEndian>) -> bool {
+    fn check_valid(&self, elf_object: &ElfBytes<'_, AnyEndian>) -> Result<bool> {
         // TODO: add checks to make sure the symbols are not actively used
         match self {
-            Self::GmonStart => true,
-            Self::ITMDeregisterTMCloneTable => true,
+            Self::GmonStart => Self::check_gprof(elf_object),
+            Self::ITMDeregisterTMCloneTable => Ok(true),
         }
     }
+
+    fn check_gprof(elf_object: &ElfBytes<'_, AnyEndian>) -> Result<bool> {
+        let shdr_dynstr = elf_object
+            .section_header_by_name(".dynstr")
+            .context(ParseElfSnafu)?
+            .ok_or(Error::NoDynstrSection)?;
+
+        let dynstr_data = elf_object
+            .section_data_as_strtab(&shdr_dynstr)
+            .context(ParseElfSnafu)?;
+
+        let mut dynstr_index = 1;
+        while (dynstr_index as u64) < shdr_dynstr.sh_size {
+            let entry = dynstr_data.get(dynstr_index).context(ParseElfSnafu)?;
+
+            if entry.contains("mcount") {
+                return Ok(false);
+            }
+            dynstr_index += entry.len() + 1;
+        }
+
+        Ok(true)
+    
 }
 
 #[derive(Default)]
@@ -166,7 +189,7 @@ impl Patcher {
         new_runpath: &str,
     ) -> Result<()> {
         let dynstr_entry_offset = self.set_runpath_dynstr(elf_object, new_runpath)?;
-        self.set_runpath_dynamic(elf_object, dynstr_entry_offset)?;
+        self.set_runpath_dynamic(elf_object, dynstr_entry_offset as u64)?;
 
         Ok(())
     }
@@ -191,12 +214,11 @@ impl Patcher {
         while (dynstr_index as u64) < shdr_dynstr.sh_size {
             let entry = dynstr_data.get(dynstr_index).context(ParseElfSnafu)?;
 
-            if entry.len() >= new_runpath.len() {
-                if let Some(candidate) = DynstrPatchCandidate::from_string(entry) {
-                    dbg!(&candidate);
+            if let Some(candidate) = DynstrPatchCandidate::from_string(entry) {
+                if entry.len() >= new_runpath.len() && candidate.check_valid(elf_object)? {
                     dynstr_candidates.push((candidate, dynstr_index));
-                };
-            }
+                }
+            };
 
             dynstr_index += entry.len() + 1;
         }
@@ -209,7 +231,7 @@ impl Patcher {
         println!(
             "{}",
             format!(
-                "Warning: Will overwrite dynstr entry: {}",
+                "Warning: Overwriting dynstr entry: {}",
                 dynstr_data
                     .get(best_dynstr_overwrite.1)
                     .context(ParseElfSnafu)?
@@ -225,25 +247,18 @@ impl Patcher {
         let patch = self.add_patch(dynstr_target_offset, new_runpath.len() + 1);
         patch.data[..new_runpath.len()].copy_from_slice(new_runpath.as_bytes());
 
-        Ok(dynstr_target_offset)
+        Ok(best_dynstr_overwrite.1)
     }
 
     fn set_runpath_dynamic(
         &mut self,
         elf_object: &'_ ElfBytes<'_, AnyEndian>,
-        dynstr_entry_offset: usize,
+        dynstr_entry_offset: u64,
     ) -> Result<()> {
         let shdr_dynamic = elf_object
             .section_header_by_name(".dynamic")
             .context(ParseElfSnafu)?
             .ok_or(Error::NoDynamicSection)?;
-
-        let shdr_dynstr = elf_object
-            .section_header_by_name(".dynstr")
-            .context(ParseElfSnafu)?
-            .ok_or(Error::NoDynstrSection)?;
-
-        let dynstr_entry_table_offset = dynstr_entry_offset as u64 - shdr_dynstr.sh_offset;
 
         let dynamic_data = elf_object
             .dynamic()
@@ -260,24 +275,17 @@ impl Patcher {
         match dynamic_data.get(dyn_entry_position + 1) {
             Ok(_) => {}
             Err(e) => match e {
-                // if there are not two DT_NULL segments following each other,
+                // If there are not two DT_NULL entries following each other,
                 // we try to find the Dyn entry, that referenced the .dynstr entry, that we
                 // corrupted and overwrite that.
                 ParseError::BadOffset(_) => {
                     dyn_entry_position = dynamic_data
                         .iter()
-                        .position(|d| d.d_val() == dynstr_entry_table_offset)
+                        .position(|d| d.d_val() == dynstr_entry_offset)
                         .ok_or(Error::NoApplicableDynamicEntry)?;
                 }
                 _ => return Err(Error::ParseElf { source: e }),
             },
-        }
-        let dyn_next_entry = dynamic_data
-            .get(dyn_entry_position + 1)
-            .context(ParseElfSnafu)?;
-
-        if dyn_next_entry.d_tag != elf::abi::DT_NULL {
-            return Err(Error::NoApplicableDynamicEntry);
         }
 
         let dyn_table_offset = dyn_entry_position
@@ -298,7 +306,7 @@ impl Patcher {
 
         let dyn_d_un_data = self
             .serializer
-            .bytes_from_unsigned_long(dynstr_entry_table_offset)
+            .bytes_from_unsigned_long(dynstr_entry_offset)
             .context(SerializingSnafu)?;
 
         let patch = self.add_patch(dyn_entry_offset, dyn_d_tag_data.len() + dyn_d_un_data.len());
