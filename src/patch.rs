@@ -72,7 +72,7 @@ impl DynstrPatchCandidate {
             _ => None,
         }
     }
-    // low has higher priority
+
     fn rank(&self) -> Option<u16> {
         match self {
             Self::GmonStart => Some(10),
@@ -81,35 +81,36 @@ impl DynstrPatchCandidate {
     }
 
     fn check_valid(&self, elf_object: &ElfBytes<'_, AnyEndian>) -> Result<bool> {
-        // TODO: add checks to make sure the symbols are not actively used
         match self {
-            Self::GmonStart => Self::check_gprof(elf_object),
-            Self::ITMDeregisterTMCloneTable => Ok(true),
+            // Check if the elf was compiled with gprof support (-pg)
+            Self::GmonStart => Ok(!(elf_dynstr_contains(elf_object, "mcount")?)),
+            // Check if the elf uses any transaction features via libitm
+            Self::ITMDeregisterTMCloneTable => Ok(!(elf_dynstr_contains(elf_object, "libitm.so")?)),
         }
     }
+}
 
-    fn check_gprof(elf_object: &ElfBytes<'_, AnyEndian>) -> Result<bool> {
-        let shdr_dynstr = elf_object
-            .section_header_by_name(".dynstr")
-            .context(ParseElfSnafu)?
-            .ok_or(Error::NoDynstrSection)?;
+fn elf_dynstr_contains(elf_object: &ElfBytes<'_, AnyEndian>, needle: &str) -> Result<bool> {
+    let shdr_dynstr = elf_object
+        .section_header_by_name(".dynstr")
+        .context(ParseElfSnafu)?
+        .ok_or(Error::NoDynstrSection)?;
 
-        let dynstr_data = elf_object
-            .section_data_as_strtab(&shdr_dynstr)
-            .context(ParseElfSnafu)?;
+    let dynstr_data = elf_object
+        .section_data_as_strtab(&shdr_dynstr)
+        .context(ParseElfSnafu)?;
 
-        let mut dynstr_index = 1;
-        while (dynstr_index as u64) < shdr_dynstr.sh_size {
-            let entry = dynstr_data.get(dynstr_index).context(ParseElfSnafu)?;
+    let mut dynstr_index = 1;
+    while (dynstr_index as u64) < shdr_dynstr.sh_size {
+        let entry = dynstr_data.get(dynstr_index).context(ParseElfSnafu)?;
 
-            if entry.contains("mcount") {
-                return Ok(false);
-            }
-            dynstr_index += entry.len() + 1;
+        if entry.contains(needle) {
+            return Ok(true);
         }
-
-        Ok(true)
+        dynstr_index += entry.len() + 1;
     }
+
+    Ok(false)
 }
 
 #[derive(Default)]
@@ -136,12 +137,11 @@ impl Patcher {
     }
 
     pub fn apply_patches_to(&self, binary_data: &mut Vec<u8>) {
-        // TODO: Add overlap check
         for patch in self.patches.iter() {
             let patch_end = patch.offset + patch.data.len();
-            if patch_end > binary_data.len() {
-                binary_data.resize(patch_end, 0);
-            }
+
+            assert!(patch_end <= binary_data.len());
+
             binary_data[patch.offset..patch_end].copy_from_slice(&patch.data)
         }
     }
@@ -264,6 +264,7 @@ impl Patcher {
             .dynamic()
             .context(ParseElfSnafu)?
             .ok_or(Error::NoDynamicSection)?;
+
         let dynamic_sh_offset =
             usize::try_from(shdr_dynamic.sh_offset).context(IntConversionSnafu)?;
 
