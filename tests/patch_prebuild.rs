@@ -1,6 +1,5 @@
 use patchelfdd::{opts::Opts, patchelfdd::Error, run};
 
-use colored::Colorize;
 use std::{fs, path::PathBuf, process::Command};
 
 const TEST_INTERPPATH: &str = "/lib-sus.so";
@@ -19,6 +18,14 @@ fn patch_minimal_i386() -> Result<(), Error> {
     Ok(())
 }
 
+#[test]
+fn patch_itm_gprof_amd64() -> Result<(), String> {
+    match test_prebuild_patch("./tests/prebuild/itm-gprof-amd64", LIBC::ELF64) {
+        Ok(_) => Err("Should fail".to_string()),
+        Err(_) => Ok(()),
+    }
+}
+
 enum LIBC {
     ELF32,
     ELF64,
@@ -35,7 +42,6 @@ fn setup(scratch_dir: &PathBuf, libc: LIBC) {
             fs::copy(NATIVE_LIBC64, local_libc).expect("Failed to copy native libc");
         }
     }
-    fs::create_dir_all(scratch_dir.join("lib64")).expect("Failed to create directory");
 }
 
 fn verify_patches_with_ldd(executable_path: &PathBuf, scratch_dir: &str) {
@@ -66,8 +72,8 @@ fn verify_patches_with_ldd(executable_path: &PathBuf, scratch_dir: &str) {
 fn test_prebuild_patch(prebuild_path: &str, libc: LIBC) -> Result<(), Error> {
     let path = PathBuf::from(prebuild_path);
     let scratch_dir = PathBuf::from(match libc {
-        LIBC::ELF32 => "./test_elf32",
-        LIBC::ELF64 => "./test_elf64",
+        LIBC::ELF32 => "/tmp/elf32dd",
+        LIBC::ELF64 => "/tmp/elf64dd",
     });
 
     setup(&scratch_dir, libc);
@@ -81,14 +87,9 @@ fn test_prebuild_patch(prebuild_path: &str, libc: LIBC) -> Result<(), Error> {
         set_interpreter: Some(TEST_INTERPPATH.to_string()),
     };
 
-    if let Err(err) = run(opts) {
-        eprintln!("{}", format!("Error - {}", err).red());
-        assert!(false);
-    }
+    run(opts)?;
 
     verify_patches_with_ldd(&scratch_executable, &scratch_dir.to_string_lossy());
-
-    fs::remove_dir_all(&scratch_dir).expect("Failed to remove test directory");
 
     Ok(())
 }
