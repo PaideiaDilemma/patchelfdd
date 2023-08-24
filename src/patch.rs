@@ -1,16 +1,35 @@
-use crate::serialize::{self, ArchSerializer};
+use crate::{
+    serialize::{self, ArchSerializer},
+    sparse_elf::{self, SparseElf},
+};
 
 use colored::Colorize;
-use std::mem::size_of;
-
-use elf::{endian::AnyEndian, ElfBytes, ParseError};
+use std::{fs::OpenOptions, io::Seek, io::SeekFrom, io::Write, mem::size_of, path::PathBuf};
 
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Failed to open file {} for writing: {}", file_path, source))]
+    OpenElfWritable {
+        file_path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to seek to offset {}: {}", offset, source))]
+    SeekElf {
+        offset: usize,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Failed to parse elf: {}", source))]
-    ParseElf { source: ParseError },
+    ParseElf { source: elf::ParseError },
+
+    #[snafu(display("Failed to write elf: {}", source))]
+    WriteElf { source: std::io::Error },
+
+    #[snafu(display("{}", source))]
+    SparseElf { source: sparse_elf::Error },
 
     #[snafu(display("Failed to cast integer: {}", source))]
     IntConversion { source: std::num::TryFromIntError },
@@ -20,15 +39,6 @@ pub enum Error {
 
     #[snafu(display("Integer overflow"))]
     IntegerOverflow,
-
-    #[snafu(display("Elf is missing a .dynamic section"))]
-    NoDynamicSection,
-
-    #[snafu(display("Elf is missing .dynstr section"))]
-    NoDynstrSection,
-
-    #[snafu(display("Elf is missing .interp section"))]
-    NoInterpSection,
 
     #[snafu(display("Did not find an appropriate entry in .dynstr to replace with DT_RUNPATH"))]
     NoDynstrReplacementCandidate,
@@ -58,59 +68,33 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
-enum DynstrPatchCandidate {
+#[derive(Copy, Clone)]
+enum DynstrPatchCandidates {
     GmonStart,
     ITMDeregisterTMCloneTable,
 }
 
-impl DynstrPatchCandidate {
-    fn from_string(data: &str) -> Option<Self> {
-        match data {
-            "__gmon_start__" => Some(DynstrPatchCandidate::GmonStart),
-            "_ITM_deregisterTMCloneTable" => Some(DynstrPatchCandidate::ITMDeregisterTMCloneTable),
-            _ => None,
-        }
-    }
-
-    fn rank(&self) -> Option<u16> {
+impl DynstrPatchCandidates {
+    fn as_string(&self) -> &'static str {
         match self {
-            Self::GmonStart => Some(10),
-            Self::ITMDeregisterTMCloneTable => Some(1),
+            Self::GmonStart => "__gmon_start__",
+            Self::ITMDeregisterTMCloneTable => "_ITM_deregisterTMCloneTable",
         }
     }
 
-    fn check_valid(&self, elf_object: &ElfBytes<'_, AnyEndian>) -> Result<bool> {
-        match self {
-            // Check if the elf was compiled with gprof support (-pg)
-            Self::GmonStart => Ok(!(elf_dynstr_contains(elf_object, "mcount")?)),
-            // Check if the elf uses any transaction features via libitm
-            Self::ITMDeregisterTMCloneTable => Ok(!(elf_dynstr_contains(elf_object, "libitm.so")?)),
+    fn get_valid_candiates(elf: &mut SparseElf) -> Result<Vec<Self>> {
+        let mut res: Vec<Self> = Vec::new();
+
+        if !(elf.dynstr_contains("mcount").context(SparseElfSnafu)?) {
+            res.push(Self::GmonStart);
         }
-    }
-}
 
-fn elf_dynstr_contains(elf_object: &ElfBytes<'_, AnyEndian>, needle: &str) -> Result<bool> {
-    let shdr_dynstr = elf_object
-        .section_header_by_name(".dynstr")
-        .context(ParseElfSnafu)?
-        .ok_or(Error::NoDynstrSection)?;
-
-    let dynstr_data = elf_object
-        .section_data_as_strtab(&shdr_dynstr)
-        .context(ParseElfSnafu)?;
-
-    let mut dynstr_index = 1;
-    while (dynstr_index as u64) < shdr_dynstr.sh_size {
-        let entry = dynstr_data.get(dynstr_index).context(ParseElfSnafu)?;
-
-        if entry.contains(needle) {
-            return Ok(true);
+        if !(elf.dynstr_contains("libitm.so").context(SparseElfSnafu)?) {
+            res.push(Self::ITMDeregisterTMCloneTable);
         }
-        dynstr_index += entry.len() + 1;
-    }
 
-    Ok(false)
+        Ok(res)
+    }
 }
 
 #[derive(Default)]
@@ -120,30 +104,48 @@ struct Patch {
 }
 
 pub struct Patcher {
+    pub elf: SparseElf,
     patches: Vec<Patch>,
     serializer: ArchSerializer,
+    file_path: PathBuf,
 }
 
 impl Patcher {
-    pub fn new(elf_object: &ElfBytes<'_, AnyEndian>) -> Self {
-        Self {
+    pub fn new(file_path: &PathBuf) -> Result<Self> {
+        let elf = SparseElf::new(file_path).context(SparseElfSnafu)?;
+        let serializer = ArchSerializer::new(elf.class(), elf.endianess());
+        Ok(Self {
+            elf,
             patches: Vec::new(),
-            serializer: ArchSerializer::new(elf_object.ehdr.class, elf_object.ehdr.endianness),
-        }
+            serializer,
+            file_path: file_path.clone(),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.patches.is_empty()
     }
 
-    pub fn apply_patches_to(&self, binary_data: &mut Vec<u8>) {
+    pub fn apply(&mut self) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&self.file_path)
+            .context(OpenElfWritableSnafu {
+                file_path: self.file_path.to_string_lossy(),
+            })?;
+
+        self.patches.sort_by_key(|p| p.offset);
+
         for patch in self.patches.iter() {
-            let patch_end = patch.offset + patch.data.len();
+            file.seek(SeekFrom::Start(patch.offset as u64))
+                .context(SeekElfSnafu {
+                    offset: patch.offset,
+                })?;
 
-            assert!(patch_end <= binary_data.len());
-
-            binary_data[patch.offset..patch_end].copy_from_slice(&patch.data)
+            file.write_all(&patch.data).context(WriteElfSnafu)?;
         }
+
+        Ok(())
     }
 
     fn add_patch(&mut self, offset: usize, size: usize) -> &mut Patch {
@@ -155,20 +157,9 @@ impl Patcher {
         self.patches.last_mut().unwrap()
     }
 
-    pub fn set_interpreter_path(
-        &mut self,
-        elf_object: &ElfBytes<'_, AnyEndian>,
-        new_interpreter_path: &str,
-    ) -> Result<()> {
-        let shdr_interp = elf_object
-            .section_header_by_name(".interp")
-            .context(ParseElfSnafu)?
-            .ok_or(Error::NoInterpSection)?;
-
-        let interp_sh_offset =
-            usize::try_from(shdr_interp.sh_offset).context(IntConversionSnafu)?;
-
-        let interp_sh_size = usize::try_from(shdr_interp.sh_size).context(IntConversionSnafu)?;
+    pub fn set_interpreter_path(&mut self, new_interpreter_path: &str) -> Result<()> {
+        let interp_sh_size =
+            usize::try_from(self.elf.shdr_interp.sh_size).context(IntConversionSnafu)?;
 
         if interp_sh_size < new_interpreter_path.len() {
             return Err(Error::CannotFitInterpreterPath {
@@ -177,96 +168,75 @@ impl Patcher {
             });
         }
 
+        let interp_sh_offset =
+            usize::try_from(self.elf.shdr_interp.sh_offset).context(IntConversionSnafu)?;
+
         let patch = self.add_patch(interp_sh_offset, new_interpreter_path.len() + 1);
         patch.data[..new_interpreter_path.len()].copy_from_slice(new_interpreter_path.as_bytes());
 
         Ok(())
     }
 
-    pub fn set_runpath(
-        &mut self,
-        elf_object: &ElfBytes<'_, AnyEndian>,
-        new_runpath: &str,
-    ) -> Result<()> {
-        let dynstr_entry_offset = self.set_runpath_dynstr(elf_object, new_runpath)?;
-        self.set_runpath_dynamic(elf_object, dynstr_entry_offset as u64)?;
+    pub fn set_runpath(&mut self, new_runpath: &str) -> Result<()> {
+        let dynstr_entry_offset = self.set_runpath_dynstr(new_runpath)?;
+        self.set_runpath_dynamic(dynstr_entry_offset as u64)?;
 
         Ok(())
     }
 
-    fn set_runpath_dynstr(
-        &mut self,
-        elf_object: &ElfBytes<'_, AnyEndian>,
-        new_runpath: &str,
-    ) -> Result<usize> {
-        let shdr_dynstr = elf_object
-            .section_header_by_name(".dynstr")
-            .context(ParseElfSnafu)?
-            .ok_or(Error::NoDynstrSection)?;
-
-        let dynstr_data = elf_object
-            .section_data_as_strtab(&shdr_dynstr)
-            .context(ParseElfSnafu)?;
+    fn set_runpath_dynstr(&mut self, new_runpath: &str) -> Result<usize> {
+        let valid_candidates = DynstrPatchCandidates::get_valid_candiates(&mut self.elf)?;
 
         let mut dynstr_index = 1;
-        let mut dynstr_candidates: Vec<(DynstrPatchCandidate, usize)> = Vec::new();
+        let mut dynstr_candidate: Option<DynstrPatchCandidates> = None;
 
-        while (dynstr_index as u64) < shdr_dynstr.sh_size {
+        let dynstr_sh_size = self.elf.shdr_dynstr.sh_size;
+
+        let dynstr_data = self.elf.dynstr().context(SparseElfSnafu)?;
+
+        while (dynstr_index as u64) < dynstr_sh_size {
             let entry = dynstr_data.get(dynstr_index).context(ParseElfSnafu)?;
 
-            if let Some(candidate) = DynstrPatchCandidate::from_string(entry) {
-                if entry.len() >= new_runpath.len() && candidate.check_valid(elf_object)? {
-                    dynstr_candidates.push((candidate, dynstr_index));
+            if entry.len() >= new_runpath.len() {
+                if let Some(candidate) = valid_candidates.iter().find(|c| c.as_string() == entry) {
+                    dynstr_candidate = Some(*candidate);
+                    break;
                 }
-            };
+            }
 
             dynstr_index += entry.len() + 1;
         }
 
-        let best_dynstr_overwrite = dynstr_candidates
-            .iter()
-            .max_by_key(|a| a.0.rank())
-            .ok_or(Error::NoDynstrReplacementCandidate)?;
+        let dynstr_candidate = match dynstr_candidate {
+            Some(candidate) => candidate,
+            None => return Err(Error::NoDynstrReplacementCandidate),
+        };
 
         println!(
             "{}",
             format!(
                 "Warning: Overwriting dynstr entry: {}",
-                dynstr_data
-                    .get(best_dynstr_overwrite.1)
-                    .context(ParseElfSnafu)?
+                dynstr_candidate.as_string()
             )
             .yellow()
             .bold()
         );
 
-        let dynstr_target_offset = usize::try_from(shdr_dynstr.sh_offset)
+        let dynstr_target_offset = usize::try_from(self.elf.shdr_dynstr.sh_offset)
             .context(IntConversionSnafu)?
-            + best_dynstr_overwrite.1;
+            + dynstr_index;
 
         let patch = self.add_patch(dynstr_target_offset, new_runpath.len() + 1);
         patch.data[..new_runpath.len()].copy_from_slice(new_runpath.as_bytes());
 
-        Ok(best_dynstr_overwrite.1)
+        Ok(dynstr_index)
     }
 
-    fn set_runpath_dynamic(
-        &mut self,
-        elf_object: &'_ ElfBytes<'_, AnyEndian>,
-        dynstr_entry_offset: u64,
-    ) -> Result<()> {
-        let shdr_dynamic = elf_object
-            .section_header_by_name(".dynamic")
-            .context(ParseElfSnafu)?
-            .ok_or(Error::NoDynamicSection)?;
-
-        let dynamic_data = elf_object
-            .dynamic()
-            .context(ParseElfSnafu)?
-            .ok_or(Error::NoDynamicSection)?;
-
+    fn set_runpath_dynamic(&mut self, dynstr_entry_offset: u64) -> Result<()> {
         let dynamic_sh_offset =
-            usize::try_from(shdr_dynamic.sh_offset).context(IntConversionSnafu)?;
+            usize::try_from(self.elf.shdr_dynamic.sh_offset).context(IntConversionSnafu)?;
+
+        let dynamic_data = self.elf.dynamic().context(SparseElfSnafu)?;
 
         let mut dyn_entry_position = dynamic_data
             .iter()
@@ -279,7 +249,7 @@ impl Patcher {
                 // If there are not two DT_NULL entries following each other,
                 // we try to find the Dyn entry, that referenced the .dynstr entry, that we
                 // corrupted and overwrite that.
-                ParseError::BadOffset(_) => {
+                elf::ParseError::BadOffset(_) => {
                     dyn_entry_position = dynamic_data
                         .iter()
                         .position(|d| d.d_val() == dynstr_entry_offset)
@@ -290,7 +260,7 @@ impl Patcher {
         }
 
         let dyn_table_offset = dyn_entry_position
-            .checked_mul(match elf_object.ehdr.class {
+            .checked_mul(match self.elf.class() {
                 elf::file::Class::ELF32 => size_of::<elf::dynamic::Elf32_Dyn>(),
                 elf::file::Class::ELF64 => size_of::<elf::dynamic::Elf64_Dyn>(),
             })
